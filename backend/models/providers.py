@@ -34,6 +34,11 @@ class AIProviderConfig(BaseModel):
     max_tokens: int = Field(4096, ge=1, le=32000)
     top_p: float = Field(0.95, ge=0.0, le=1.0)
 
+    # Whether this provider/endpoint supports OpenAI-style tool calling.
+    # vLLM requires --enable-auto-tool-choice + --tool-call-parser at launch,
+    # so it defaults to off and can be enabled via VLLM_ENABLE_TOOLS.
+    supports_tools: bool = True
+
     capabilities: List[ModelCapability] = Field(default_factory=list)
     provider_settings: Dict[str, Any] = Field(default_factory=dict)
 

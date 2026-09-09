@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     vllm_url: str = "http://localhost:8000/v1"
     vllm_model: str = "Qwen/Qwen2.5-14B-Instruct"
     vllm_api_key: Optional[str] = None  # bearer token for secured vLLM endpoints
+    vllm_enable_tools: bool = False  # set True only if vLLM launched with tool-calling flags
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
     anthropic_api_key: Optional[str] = None

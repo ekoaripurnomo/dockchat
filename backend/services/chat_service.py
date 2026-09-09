@@ -127,14 +127,30 @@ class ChatService:
         messages.extend(history)
         messages.append({"role": "user", "content": message})
         tool_calls_made: List[Dict[str, Any]] = []
+        use_tools = getattr(config, "supports_tools", True)
 
         for _ in range(5):  # bounded tool-call loop
-            resp = await client.chat.completions.create(
-                model=config.model, messages=messages, tools=TOOLS,
+            kwargs = dict(
+                model=config.model, messages=messages,
                 temperature=config.temperature, max_tokens=config.max_tokens, top_p=config.top_p,
             )
+            if use_tools:
+                kwargs["tools"] = TOOLS
+            try:
+                resp = await client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                # Some servers (e.g. vLLM without --enable-auto-tool-choice)
+                # reject requests that include tools. Retry once without them
+                # so the user still gets a conversational reply.
+                if use_tools and "tool" in str(exc).lower():
+                    use_tools = False
+                    kwargs.pop("tools", None)
+                    resp = await client.chat.completions.create(**kwargs)
+                else:
+                    raise
+
             choice = resp.choices[0].message
-            if not choice.tool_calls:
+            if not use_tools or not choice.tool_calls:
                 return {"reply": choice.content or "", "tool_calls": tool_calls_made}
 
             messages.append({

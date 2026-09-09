@@ -177,12 +177,16 @@ class UserService:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         now = datetime.now(timezone.utc)
+        # A unique jti guarantees distinct tokens even when issued within the
+        # same second, avoiding UNIQUE(token) collisions and improving security.
         access_token = self._encode({
             "sub": str(user_id), "username": user.username, "role": "user",
+            "jti": str(uuid4()), "iat": now,
             "exp": now + timedelta(seconds=self.settings.access_token_expire_seconds),
         })
         refresh_token = self._encode({
             "sub": str(user_id), "type": "refresh",
+            "jti": str(uuid4()), "iat": now,
             "exp": now + timedelta(seconds=self.settings.refresh_token_expire_seconds),
         })
         await self._store_session(user_id, refresh_token, now)
@@ -201,9 +205,12 @@ class UserService:
                 }
             return
         async with self.db.pool.acquire() as conn:
+            # Compute expiry in the database to avoid tz-aware/naive mismatches
+            # with the column type.
             await conn.execute(
-                "INSERT INTO user_sessions (user_id, token, expires_at) VALUES ($1, $2, $3)",
-                user_id, token, expires,
+                """INSERT INTO user_sessions (user_id, token, expires_at)
+                   VALUES ($1, $2, NOW() + make_interval(secs => $3))""",
+                user_id, token, float(self.settings.refresh_token_expire_seconds),
             )
 
     async def refresh_token(self, refresh_token: str) -> TokenResponse:

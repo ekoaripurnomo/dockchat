@@ -37,6 +37,33 @@ def api_get(path: str, auth: bool = True) -> requests.Response:
     return requests.get(f"{API_BASE_URL}{path}", headers=auth_headers() if auth else {}, timeout=60)
 
 
+def parse_json(resp: requests.Response) -> Any:
+    """Parse a response body as JSON, returning None if it isn't valid JSON.
+
+    The backend always returns JSON, so a non-JSON body means the request hit
+    something else (wrong URL, a proxy, an unhandled error). Callers use the
+    None result to show a clear message instead of a raw JSON decode error.
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def show_response_error(resp: requests.Response, fallback: str) -> None:
+    """Render a helpful error for a non-200 or non-JSON response."""
+    body = parse_json(resp)
+    if isinstance(body, dict) and body.get("detail"):
+        st.error(f"{fallback}: {body['detail']}")
+    else:
+        snippet = (resp.text or "").strip()[:200]
+        st.error(
+            f"{fallback} (HTTP {resp.status_code}). "
+            f"The backend at {API_BASE_URL} returned an unexpected response."
+            + (f"\n\n{snippet}" if snippet else "")
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Auth
 # --------------------------------------------------------------------------- #

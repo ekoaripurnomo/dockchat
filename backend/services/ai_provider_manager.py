@@ -26,7 +26,8 @@ class AIProviderManager:
         """Register the default providers based on environment configuration."""
         vllm = AIProviderConfig(
             provider_type=ProviderType.VLLM, name="vllm", model=self.settings.vllm_model,
-            base_url=self.settings.vllm_url, api_key=self.settings.vllm_api_key, is_default=True,
+            base_url=self.settings.vllm_url, api_key=self.settings.vllm_api_key,
+            supports_tools=self.settings.vllm_enable_tools, is_default=True,
         )
         self.register_provider(vllm)
 
