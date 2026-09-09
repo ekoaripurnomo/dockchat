@@ -8,11 +8,14 @@ natural-language answer.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from backend.models.docker import (
+    BuildImageRequest,
     CreateContainerRequest,
+    DeployProjectRequest,
     DockerfileGenerationRequest,
     ProjectAnalysisRequest,
 )
@@ -23,9 +26,17 @@ from backend.services.project_service import ProjectService
 
 SYSTEM_PROMPT = (
     "You are dockchat, an AI assistant that manages Docker containers and generates "
-    "Docker configurations through conversation. Use the provided tools to inspect "
-    "projects, generate Dockerfiles, and manage containers on the user's behalf. "
-    "Be concise and confirm actions you take."
+    "Docker configurations through conversation. Use the provided tools to do the work "
+    "yourself; never tell the user to run docker commands manually.\n"
+    "Rules:\n"
+    "- To run a project as a container, use deploy_project (it analyzes, writes the "
+    "Dockerfile, builds the image, and runs the container in one step). Prefer this "
+    "when the user asks to build and/or run a project directory.\n"
+    "- create_container only works with an image that already exists. If the image "
+    "was not built yet, use build_image or deploy_project first. Do not invent image names.\n"
+    "- ports must be a JSON object mapping container port to host port using STRING keys, "
+    'e.g. {"80": 8080}. dockchat auto-selects a free host port if the requested one is taken.\n'
+    "- Be concise and confirm the concrete actions you took (image tag, container name, port)."
 )
 
 # OpenAI-compatible tool schema.
@@ -62,6 +73,43 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "build_image",
+            "description": "Build a Docker image from a project directory that already contains a Dockerfile.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the project directory"},
+                    "tag": {"type": "string", "description": "Image tag, e.g. myapp:latest"},
+                },
+                "required": ["path", "tag"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deploy_project",
+            "description": (
+                "One-shot deploy: analyze a project directory, generate and write its "
+                "Dockerfile, build the image, and run it as a container. Use this when the "
+                "user asks to build and run / deploy a project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the project directory"},
+                    "name": {"type": "string", "description": "Optional container name"},
+                    "base_image": {"type": "string"},
+                    "exposed_port": {"type": "integer", "description": "Container port to publish"},
+                    "host_port": {"type": "integer", "description": "Host port (defaults to a free port)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_containers",
             "description": "List the current user's Docker containers.",
             "parameters": {"type": "object", "properties": {}},
@@ -71,13 +119,19 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_container",
-            "description": "Create and run a Docker container from an image.",
+            "description": (
+                "Create and run a container from an image that ALREADY EXISTS locally. "
+                "If the image was not built yet, call build_image or deploy_project first."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "image": {"type": "string"},
                     "name": {"type": "string"},
-                    "ports": {"type": "object", "description": "Map of container_port -> host_port"},
+                    "ports": {
+                        "type": "object",
+                        "description": 'Map of container_port -> host_port with string keys, e.g. {"80": 8080}',
+                    },
                     "environment": {"type": "object"},
                 },
                 "required": ["image"],
@@ -98,16 +152,64 @@ class ChatService:
         self.docker = docker_service
         self.projects = project_service
 
+    # Matches absolute unix paths like /home/eko/data/hextris in a message.
+    _PATH_RE = re.compile(r"(/[\w.\-]+(?:/[\w.\-]+)+)")
+
+    def _auto_analysis_context(self, message: str) -> Optional[str]:
+        """When tool-calling is unavailable, proactively analyze any project path
+        mentioned in the message and return a context string for the model.
+
+        This lets the assistant answer with real project details (type, language,
+        framework, files, README excerpt) instead of asking the user for them.
+        """
+        match = self._PATH_RE.search(message)
+        if not match:
+            return None
+        path = match.group(1).rstrip("/.,)")
+        if not self.projects.validate_user_path(path):
+            return None
+        try:
+            analysis = self.projects.analyze_project(ProjectAnalysisRequest(path=path))
+        except Exception:
+            return None
+        data = analysis.model_dump()
+        # Keep the injected context compact.
+        for key in ("detected_files",):
+            if isinstance(data.get(key), list) and len(data[key]) > 40:
+                data[key] = data[key][:40] + ["..."]
+        return (
+            "The following project analysis was performed automatically on the path "
+            f"mentioned by the user. Use it to answer without asking for more details:\n"
+            f"{json.dumps(data, indent=2, default=str)}"
+        )
+
+    @staticmethod
+    def _normalize_ports(args: Dict[str, Any]) -> None:
+        """Coerce ports into {str: int}. Models sometimes emit integer keys
+        ({80: 80}) or string values, which would fail validation."""
+        ports = args.get("ports")
+        if isinstance(ports, dict):
+            args["ports"] = {str(k): int(v) for k, v in ports.items()}
+
     async def _dispatch_tool(self, name: str, args: Dict[str, Any], user_id: UUID) -> Dict[str, Any]:
         try:
             if name == "analyze_project":
                 return self.projects.analyze_project(ProjectAnalysisRequest(**args)).model_dump()
             if name == "generate_dockerfile":
                 return self.projects.generate_dockerfile(DockerfileGenerationRequest(**args)).model_dump()
+            if name == "build_image":
+                return (await self.docker.build_image(
+                    args["path"], args["tag"], user_id
+                )).model_dump()
+            if name == "deploy_project":
+                return (await self.projects.deploy_project(
+                    DeployProjectRequest(**args), user_id, self.docker
+                )).model_dump()
             if name == "list_containers":
                 items = await self.docker.list_containers(user_id)
                 return {"containers": [c.model_dump() for c in items]}
             if name == "create_container":
+                self._normalize_ports(args)
                 info = await self.docker.create_container(CreateContainerRequest(**args), user_id)
                 return info.model_dump()
             return {"error": f"Unknown tool: {name}"}
@@ -125,9 +227,18 @@ class ChatService:
     async def _chat_openai(self, client, config, user_id, message, history) -> Dict[str, Any]:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history)
-        messages.append({"role": "user", "content": message})
         tool_calls_made: List[Dict[str, Any]] = []
         use_tools = getattr(config, "supports_tools", True)
+
+        # Without server-side tool-calling, gather project context ourselves so
+        # the model can answer instead of asking the user for details.
+        if not use_tools:
+            ctx = self._auto_analysis_context(message)
+            if ctx:
+                messages.append({"role": "system", "content": ctx})
+                tool_calls_made.append({"tool": "analyze_project", "auto": True})
+
+        messages.append({"role": "user", "content": message})
 
         for _ in range(5):  # bounded tool-call loop
             kwargs = dict(
@@ -177,8 +288,14 @@ class ChatService:
             }
             for t in TOOLS
         ]
-        messages = list(history) + [{"role": "user", "content": message}]
+        messages = list(history)
         tool_calls_made: List[Dict[str, Any]] = []
+        if not getattr(config, "supports_tools", True):
+            ctx = self._auto_analysis_context(message)
+            if ctx:
+                messages.append({"role": "user", "content": ctx})
+                tool_calls_made.append({"tool": "analyze_project", "auto": True})
+        messages.append({"role": "user", "content": message})
 
         for _ in range(5):
             resp = await client.messages.create(

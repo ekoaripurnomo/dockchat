@@ -13,8 +13,13 @@ from typing import List, Optional
 from fastapi import HTTPException
 from jinja2 import Environment, StrictUndefined
 
+from uuid import UUID
+
 from backend.config import Settings
 from backend.models.docker import (
+    CreateContainerRequest,
+    DeployProjectRequest,
+    DeployProjectResponse,
     DockerfileGenerationRequest,
     DockerfileResponse,
     ProjectAnalysis,
@@ -46,6 +51,14 @@ _DETECTORS = [
     {
         "type": "java", "marker": "pom.xml", "language": "java",
         "package_manager": "maven", "base_image": "eclipse-temurin:21-jdk", "port": 8080,
+    },
+    {
+        "type": "php", "marker": "composer.json", "language": "php",
+        "package_manager": "composer", "base_image": "php:8.3-apache", "port": 80,
+    },
+    {
+        "type": "ruby", "marker": "Gemfile", "language": "ruby",
+        "package_manager": "bundler", "base_image": "ruby:3.3-slim", "port": 3000,
     },
 ]
 
@@ -100,6 +113,27 @@ COPY --from=build /src/target/*.jar /app/app.jar
 EXPOSE {{ port }}
 CMD ["java", "-jar", "/app/app.jar"]
 """,
+    "static": """\
+FROM {{ base_image }}
+COPY . /usr/share/nginx/html
+EXPOSE {{ port }}
+CMD ["nginx", "-g", "daemon off;"]
+""",
+    "php": """\
+FROM {{ base_image }}
+WORKDIR /var/www/html
+COPY . .
+EXPOSE {{ port }}
+""",
+    "ruby": """\
+FROM {{ base_image }}
+WORKDIR /app
+COPY Gemfile* ./
+RUN bundle install
+COPY . .
+EXPOSE {{ port }}
+CMD ["ruby", "{{ entrypoint }}"]
+""",
     "generic": """\
 FROM {{ base_image }}
 WORKDIR /app
@@ -147,26 +181,75 @@ class ProjectService:
     def analyze_project(self, request: ProjectAnalysisRequest) -> ProjectAnalysis:
         root = self._validate_path(request.path)
         present = {p.name for p in root.iterdir() if p.is_file()}
+        subdirs = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+        readme = self._read_readme(root, present)
 
         for rule in _DETECTORS:
             if rule["marker"] in present:
                 entrypoint = self._guess_entrypoint(root, rule["type"], present)
-                return ProjectAnalysis(
+                framework = self._guess_framework(root, rule["type"], present)
+                analysis = ProjectAnalysis(
                     path=str(root),
                     project_type=rule["type"],
                     language=rule["language"],
-                    framework=self._guess_framework(root, rule["type"], present),
+                    framework=framework,
                     package_manager=rule["package_manager"],
                     entrypoint=entrypoint,
                     detected_files=sorted(present),
+                    subdirectories=subdirs,
                     suggested_base_image=rule["base_image"],
                     exposed_port=rule["port"],
+                    readme_excerpt=readme,
                 )
+                analysis.summary = self._summarize(analysis)
+                return analysis
 
-        return ProjectAnalysis(
+        # No build-system marker. Detect a static website (HTML/JS/CSS).
+        if self._is_static_site(present, subdirs):
+            analysis = ProjectAnalysis(
+                path=str(root), project_type="static", language="html",
+                framework="static-site", entrypoint="index.html",
+                detected_files=sorted(present), subdirectories=subdirs,
+                suggested_base_image="nginx:alpine", exposed_port=80,
+                readme_excerpt=readme,
+            )
+            analysis.summary = self._summarize(analysis)
+            return analysis
+
+        analysis = ProjectAnalysis(
             path=str(root), project_type="generic", detected_files=sorted(present),
-            suggested_base_image="ubuntu:22.04", exposed_port=8080,
+            subdirectories=subdirs, suggested_base_image="ubuntu:22.04",
+            exposed_port=8080, readme_excerpt=readme,
         )
+        analysis.summary = self._summarize(analysis)
+        return analysis
+
+    def _is_static_site(self, present: set, subdirs: List[str]) -> bool:
+        html_files = [f for f in present if f.lower().endswith((".html", ".htm"))]
+        has_index = any(f.lower() == "index.html" for f in present)
+        has_web_assets = bool({"js", "css", "style", "styles", "assets", "static"} & set(subdirs))
+        return has_index or (bool(html_files) and has_web_assets)
+
+    def _read_readme(self, root: Path, present: set) -> Optional[str]:
+        for name in present:
+            if name.lower() in ("readme.md", "readme.txt", "readme", "readme.rst"):
+                try:
+                    text = (root / name).read_text(encoding="utf-8", errors="ignore")
+                    return text[:1500]
+                except OSError:
+                    return None
+        return None
+
+    def _summarize(self, a: ProjectAnalysis) -> str:
+        parts = [f"Detected a {a.project_type} project"]
+        if a.framework:
+            parts.append(f"using {a.framework}")
+        if a.language:
+            parts.append(f"({a.language})")
+        parts.append(f". Suggested base image: {a.suggested_base_image}, port {a.exposed_port}.")
+        if a.entrypoint:
+            parts.append(f" Entry point: {a.entrypoint}.")
+        return " ".join(parts).replace(" .", ".")
 
     def _guess_entrypoint(self, root: Path, ptype: str, present: set) -> Optional[str]:
         if ptype == "node":
@@ -217,4 +300,43 @@ class ProjectService:
 
         return DockerfileResponse(
             dockerfile=dockerfile, dockerignore=_DOCKERIGNORE, written_path=written_path
+        )
+
+    async def deploy_project(
+        self, request: DeployProjectRequest, user_id: UUID, docker_service
+    ) -> DeployProjectResponse:
+        """End-to-end: analyze -> generate Dockerfile (on disk) -> build -> run.
+
+        ``docker_service`` is passed in to avoid a construction-time circular
+        dependency between the project and docker services.
+        """
+        root = self._validate_path(request.path)
+
+        analysis = self.analyze_project(ProjectAnalysisRequest(path=str(root)))
+        container_port = request.exposed_port or analysis.exposed_port or 8080
+
+        # 1. Generate and write the Dockerfile + .dockerignore.
+        df = self.generate_dockerfile(DockerfileGenerationRequest(
+            path=str(root), base_image=request.base_image,
+            exposed_port=container_port, write_to_disk=True,
+        ))
+
+        # 2. Build the image.
+        tag = request.tag or f"{root.name.lower()}:latest"
+        build = await docker_service.build_image(str(root), tag, user_id)
+
+        # 3. Run the container, publishing the exposed port.
+        host_port = request.host_port or container_port
+        container = await docker_service.create_container(
+            CreateContainerRequest(
+                image=tag, name=request.name or root.name.lower(),
+                ports={str(container_port): host_port},
+                environment=request.environment,
+            ),
+            user_id,
+        )
+
+        return DeployProjectResponse(
+            analysis=analysis, dockerfile=df.dockerfile,
+            image=build.image, container=container, build_logs=build.logs,
         )

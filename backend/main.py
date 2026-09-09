@@ -38,6 +38,10 @@ async def lifespan(app: FastAPI):
 
     # Services
     app_state.user_service = UserService(db, settings)
+    try:
+        await app_state.user_service.ensure_seed_admin()
+    except Exception as exc:  # never let a bad seed config crash startup
+        logger.warning("Seed admin skipped: %s", exc)
     app_state.audit_service = AuditService(db)
 
     provider_manager = AIProviderManager(settings)

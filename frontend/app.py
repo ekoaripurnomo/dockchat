@@ -247,6 +247,10 @@ def render_containers() -> None:
         st.warning("Docker daemon is not available on the backend host.")
         return
 
+    st.caption(
+        "This tab shows containers created through dockchat (isolated per user). "
+        "Containers started outside the app are not listed here."
+    )
     if st.button("🔄 Refresh"):
         st.rerun()
     try:
@@ -256,16 +260,37 @@ def render_containers() -> None:
         return
 
     if not containers:
-        st.info("No containers yet.")
-        return
+        st.info("You haven't created any containers through dockchat yet.")
+    else:
+        for c in containers:
+            _render_container_row(c, manageable=True)
 
-    for c in containers:
-        col1, col2, col3, col4 = st.columns([3, 2, 2, 3])
-        col1.markdown(f"**{c['name']}**")
-        col1.caption(c["image"])
-        col2.write(c["status"])
-        with col3:
-            st.code(c["id"], language=None)
+    # Admin-only: show every container on the host (including ones started
+    # outside dockchat). Only rendered for superusers.
+    user = st.session_state.get("user") or {}
+    if user.get("is_superuser"):
+        with st.expander("🛡 Admin: all host containers"):
+            resp = api_get("/api/docker/containers/all")
+            if resp.status_code == 200:
+                all_containers = resp.json()
+                if not all_containers:
+                    st.info("No containers on the host.")
+                for c in all_containers:
+                    _render_container_row(c, manageable=False)
+            elif resp.status_code == 403:
+                st.warning("Admin privileges required.")
+            else:
+                show_response_error(resp, "Failed to list host containers")
+
+
+def _render_container_row(c: Dict[str, Any], manageable: bool) -> None:
+    col1, col2, col3, col4 = st.columns([3, 2, 2, 3])
+    col1.markdown(f"**{c['name']}**")
+    col1.caption(c["image"])
+    col2.write(c["status"])
+    with col3:
+        st.code(c["id"], language=None)
+    if manageable:
         with col4:
             a1, a2, a3 = st.columns(3)
             if a1.button("▶", key=f"start_{c['id']}"):
@@ -277,31 +302,104 @@ def render_containers() -> None:
             if a3.button("🗑", key=f"rm_{c['id']}"):
                 api_post(f"/api/docker/containers/{c['id']}/remove")
                 st.rerun()
+    else:
+        col4.caption("read-only")
 
 
 def render_projects() -> None:
     st.header("🛠 Project Scaffolding")
-    path = st.text_input("Project path", placeholder="/workspace/my-app")
+    st.caption(
+        "Add a project directory to analyze it, generate a Dockerfile, build an "
+        "image, and run it as a container. The path must be inside the backend's "
+        "ALLOWED_PATHS."
+    )
 
-    col1, col2 = st.columns(2)
-    if col1.button("Analyze"):
-        if path:
-            resp = api_post("/api/docker/projects/analyze", {"path": path})
-            st.json(resp.json()) if resp.status_code == 200 else st.error(
-                resp.json().get("detail", "Analysis failed"))
+    path = st.text_input("Project directory", placeholder="/home/eko/my-app",
+                         key="proj_path")
 
-    if col2.button("Generate Dockerfile"):
-        if path:
-            resp = api_post("/api/docker/projects/generate-dockerfile",
-                            {"path": path, "write_to_disk": False})
-            if resp.status_code == 200:
-                data = resp.json()
-                st.subheader("Dockerfile")
+    colo1, colo2, colo3 = st.columns(3)
+    base_image = colo1.text_input("Base image (optional)", key="proj_base",
+                                  placeholder="auto-detected")
+    exposed_port = colo2.number_input("Container port", min_value=0, max_value=65535,
+                                      value=0, key="proj_port",
+                                      help="0 = auto-detect from project type")
+    host_port = colo3.number_input("Host port", min_value=0, max_value=65535,
+                                   value=0, key="proj_hostport",
+                                   help="0 = same as container port")
+
+    # Step buttons
+    b1, b2, b3, b4 = st.columns(4)
+    do_analyze = b1.button("🔍 Analyze")
+    do_generate = b2.button("📄 Generate Dockerfile")
+    do_write = b3.button("💾 Write to disk")
+    do_deploy = b4.button("🚀 Build & Run", type="primary")
+
+    def _opt_int(v):
+        return int(v) if v else None
+
+    if do_analyze and path:
+        resp = api_post("/api/docker/projects/analyze", {"path": path})
+        if resp.status_code == 200:
+            st.subheader("Analysis")
+            st.json(resp.json())
+        else:
+            show_response_error(resp, "Analysis failed")
+
+    if (do_generate or do_write) and path:
+        resp = api_post("/api/docker/projects/generate-dockerfile", {
+            "path": path,
+            "base_image": base_image or None,
+            "exposed_port": _opt_int(exposed_port),
+            "write_to_disk": bool(do_write),
+        })
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("written_path"):
+                st.success(f"Wrote {data['written_path']} and .dockerignore")
+            st.subheader("Dockerfile")
+            st.code(data["dockerfile"], language="dockerfile")
+            st.subheader(".dockerignore")
+            st.code(data["dockerignore"], language=None)
+        else:
+            show_response_error(resp, "Generation failed")
+
+    if do_deploy and path:
+        with st.spinner("Analyzing, generating Dockerfile, building image, and starting container..."):
+            resp = api_post("/api/docker/projects/deploy", {
+                "path": path,
+                "base_image": base_image or None,
+                "exposed_port": _opt_int(exposed_port),
+                "host_port": _opt_int(host_port),
+            })
+        if resp.status_code == 200:
+            data = resp.json()
+            c = data["container"]
+            img_tags = ", ".join(data["image"].get("tags") or []) or data["image"]["id"]
+            st.success(f"Running container '{c['name']}' ({c['status']}) from image {img_tags}")
+            with st.expander("Analysis"):
+                st.json(data["analysis"])
+            with st.expander("Dockerfile"):
                 st.code(data["dockerfile"], language="dockerfile")
-                st.subheader(".dockerignore")
-                st.code(data["dockerignore"], language=None)
-            else:
-                st.error(resp.json().get("detail", "Generation failed"))
+            with st.expander("Build logs"):
+                st.code("\n".join(data.get("build_logs") or []), language=None)
+            st.info("Manage it in the 📦 Containers tab.")
+        else:
+            show_response_error(resp, "Deploy failed")
+
+    # Show images the user has built
+    with st.expander("🧱 Your images"):
+        resp = api_get("/api/docker/images")
+        if resp.status_code == 200:
+            images = resp.json()
+            if not images:
+                st.caption("No images built yet.")
+            for img in images:
+                tags = ", ".join(img.get("tags") or []) or img["id"]
+                size = img.get("size")
+                size_str = f" · {round(size / 1e6)} MB" if size else ""
+                st.markdown(f"- `{tags}`{size_str}")
+        else:
+            show_response_error(resp, "Failed to list images")
 
 
 def render_activity() -> None:

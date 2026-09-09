@@ -103,6 +103,41 @@ class UserService:
             )
         return await self.get_user_by_id(user_id)
 
+    async def ensure_seed_admin(self) -> None:
+        """Create/promote a superuser from SEED_ADMIN_* settings if configured.
+
+        Idempotent: does nothing if the settings are incomplete, and only
+        creates the account when it does not already exist.
+        """
+        username = self.settings.seed_admin_username
+        email = self.settings.seed_admin_email
+        password = self.settings.seed_admin_password
+        if not (username and email and password):
+            return
+
+        if self.db.is_memory:
+            store = self.db.memory
+            with store.lock:
+                exists = any(u["username"] == username for u in store.users.values())
+            if not exists:
+                user = await self._create_user_memory(
+                    UserCreate(username=username, email=email, password=password, full_name="Admin")
+                )
+                with store.lock:
+                    store.users[str(user.id)]["is_superuser"] = True
+            return
+
+        async with self.db.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT id FROM users WHERE username = $1", username)
+        if not row:
+            user = await self._create_user_pg(
+                UserCreate(username=username, email=email, password=password, full_name="Admin")
+            )
+            async with self.db.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE users SET is_superuser = TRUE WHERE id = $1", user.id
+                )
+
     async def authenticate_user(self, username: str, password: str) -> Optional[UserResponse]:
         if self.db.is_memory:
             store = self.db.memory
@@ -180,7 +215,8 @@ class UserService:
         # A unique jti guarantees distinct tokens even when issued within the
         # same second, avoiding UNIQUE(token) collisions and improving security.
         access_token = self._encode({
-            "sub": str(user_id), "username": user.username, "role": "user",
+            "sub": str(user_id), "username": user.username,
+            "role": "admin" if user.is_superuser else "user",
             "jti": str(uuid4()), "iat": now,
             "exp": now + timedelta(seconds=self.settings.access_token_expire_seconds),
         })

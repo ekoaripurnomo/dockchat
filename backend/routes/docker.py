@@ -6,13 +6,16 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends
 
 from backend.dependencies import (
+    get_admin_user,
     get_audit_service,
     get_current_user,
     get_docker_service,
     get_project_service,
 )
 from backend.models.docker import (
+    BuildImageRequest,
     CreateContainerRequest,
+    DeployProjectRequest,
     DockerfileGenerationRequest,
     ProjectAnalysisRequest,
 )
@@ -53,6 +56,15 @@ async def list_containers(
     return await docker_service.list_containers(current_user["user_id"])
 
 
+@router.get("/containers/all")
+async def list_all_containers(
+    admin_user: Dict[str, Any] = Depends(get_admin_user),
+    docker_service: DockerService = Depends(get_docker_service),
+):
+    """List all containers on the host (admin/superuser only)."""
+    return await docker_service.list_all_containers()
+
+
 @router.post("/containers/{container_id}/{action}")
 async def container_action(
     container_id: str,
@@ -63,6 +75,52 @@ async def container_action(
 ):
     result = await docker_service.container_action(current_user["user_id"], container_id, action)
     await audit.log_action(current_user["user_id"], f"container_{action}", "container", container_id)
+    return result
+
+
+@router.get("/images")
+async def list_images(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    docker_service: DockerService = Depends(get_docker_service),
+):
+    return await docker_service.list_images(current_user["user_id"])
+
+
+@router.post("/images/build")
+async def build_image(
+    request: BuildImageRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    docker_service: DockerService = Depends(get_docker_service),
+    project_service: ProjectService = Depends(get_project_service),
+    audit: AuditService = Depends(get_audit_service),
+):
+    # Reuse the project service's path validation for the build context.
+    if not project_service.validate_user_path(request.path):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Access denied to this path")
+    result = await docker_service.build_image(
+        request.path, request.tag, current_user["user_id"], request.dockerfile
+    )
+    await audit.log_action(current_user["user_id"], "build_image", "image", request.tag)
+    return result
+
+
+@router.post("/projects/deploy")
+async def deploy_project(
+    request: DeployProjectRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    docker_service: DockerService = Depends(get_docker_service),
+    project_service: ProjectService = Depends(get_project_service),
+    audit: AuditService = Depends(get_audit_service),
+):
+    """Analyze a project, generate its Dockerfile, build the image and run it."""
+    result = await project_service.deploy_project(
+        request, current_user["user_id"], docker_service
+    )
+    await audit.log_action(
+        current_user["user_id"], "deploy_project", "container",
+        result.container.id, {"path": request.path, "image": result.image.tags},
+    )
     return result
 
 

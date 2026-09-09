@@ -77,6 +77,94 @@ with at least one uppercase letter, one lowercase letter, and one digit.
 - In-memory mode: accounts are lost on every backend restart, so re-register.
 - PostgreSQL mode: accounts persist.
 
+### Optional seeded admin
+
+Set all three of these in `.env` to auto-create a superuser on startup (created
+only if missing, and a bad value is logged and skipped rather than crashing):
+
+```env
+SEED_ADMIN_USERNAME="admin"
+SEED_ADMIN_EMAIL="admin@example.com"   # use a real TLD; .local is rejected
+SEED_ADMIN_PASSWORD="Admin123"
+```
+
+A superuser can see all host containers (see below).
+
+## Working with a project: analyze → Dockerfile → image → container
+
+Use the **🛠 Projects** tab (or the API directly). The project directory must be
+inside the backend's `ALLOWED_PATHS` (default `/home:/workspace:/tmp`).
+
+1. **Add the directory** — type the absolute path (e.g. `/home/eko/my-app`).
+2. **Analyze** — detects language, framework, package manager, entrypoint,
+   suggested base image, and port (`POST /api/docker/projects/analyze`).
+3. **Generate Dockerfile** — preview it, or **Write to disk** to save the
+   `Dockerfile` and `.dockerignore` into the project
+   (`POST /api/docker/projects/generate-dockerfile`).
+4. **Build & Run** — one action that analyzes, writes the Dockerfile, builds the
+   image, and starts the container with the port published
+   (`POST /api/docker/projects/deploy`). You can override the base image,
+   container port, and host port.
+
+The built image is tagged `<dirname>:latest` by default and labeled per user;
+the container appears in the **📦 Containers** tab where you can start/stop/remove
+it.
+
+Supported project types: Node, Python, Go, Rust, Java, PHP, Ruby, and **static
+sites** (HTML/JS/CSS with an `index.html`, served via nginx). Anything else falls
+back to a generic template. Analysis also reads a `README` excerpt and lists
+subdirectories to give richer context.
+
+> Note: **Build & Run / deploy writes a `Dockerfile` and `.dockerignore` into the
+> project directory** (they are needed as the build context). Generate + preview
+> without writing by using the "Generate Dockerfile" button instead.
+
+### Chat that gathers info by itself
+
+Ask the chat something like *"Create a Dockerfile for /home/eko/data/hextris"*.
+When the vLLM server has tool-calling enabled (`VLLM_ENABLE_TOOLS=true`), the
+model calls the `analyze_project` tool directly. When tool-calling is **off**
+(the default), dockchat detects the path in your message, runs the analyzer
+itself, and injects the results into the model's context — so the assistant
+answers with real project details instead of asking you for them. The path must
+be inside `ALLOWED_PATHS`.
+
+With tool-calling on, the chat can do the full job itself. Available tools:
+`analyze_project`, `generate_dockerfile`, `build_image`, `deploy_project`
+(analyze → Dockerfile → build → run), `list_containers`, and `create_container`.
+Ask it to "build and run" or "deploy" a project and it uses `deploy_project`
+rather than telling you to run docker commands manually. `create_container`
+requires an image that already exists locally; if it doesn't, the model builds
+it first.
+
+**Host port handling:** when a requested host port is already in use, dockchat
+automatically picks a free port instead of failing, and reports the mapping
+(`ports._remapped_from`). Check the actual published port in the 📦 Containers
+tab.
+
+> Building and running requires a working Docker daemon on the backend host
+> (`GET /api/docker/status` must report `available: true`).
+
+Example deploy via curl:
+
+```bash
+curl -X POST http://localhost:8080/api/docker/projects/deploy \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"path": "/home/eko/my-app", "host_port": 18080}'
+```
+
+## Container visibility & isolation
+
+The Containers tab lists only containers **dockchat created**, filtered by a
+per-user `dockchat.user=<id>` label. Containers started outside the app (via
+`docker run`, docker-compose, etc.) are intentionally hidden for multi-tenant
+isolation. If your own list is empty, that's expected until you create a
+container through dockchat.
+
+Superusers get an additional **"Admin: all host containers"** view (read-only)
+that lists every container on the host, backed by `GET /api/docker/containers/all`
+(admin only; normal users receive 403).
+
 ## Running with PostgreSQL + Redis
 
 ```bash
@@ -161,10 +249,14 @@ setting, since they call their own endpoints rather than going through the LLM.
 | `PUT /api/config/providers/{name}/parameters` | Update model params |
 | `GET /api/config/providers/{name}/test` | Test connection |
 | `GET /api/docker/status` | Docker daemon availability |
-| `GET/POST /api/docker/containers` | List / create containers |
+| `GET/POST /api/docker/containers` | List / create the user's containers |
+| `GET /api/docker/containers/all` | List all host containers (admin only) |
 | `POST /api/docker/containers/{id}/{action}` | start/stop/restart/remove |
+| `GET /api/docker/images` | List images you built |
+| `POST /api/docker/images/build` | Build an image from a project directory |
 | `POST /api/docker/projects/analyze` | Detect project type |
 | `POST /api/docker/projects/generate-dockerfile` | Generate Dockerfile |
+| `POST /api/docker/projects/deploy` | Analyze → Dockerfile → build → run, in one call |
 | `POST /api/chat` | Chat with tool-calling |
 | `GET /api/audit/logs` | User activity log |
 
@@ -195,6 +287,14 @@ flags shown in "AI providers & tool calling" and set `VLLM_ENABLE_TOOLS=true`.
 **`401 Unauthorized` from the vLLM endpoint**
 Set `VLLM_API_KEY` to the bare token with no `Bearer ` prefix — the client adds
 `Bearer` itself, so a prefixed value becomes `Bearer Bearer ...` and fails.
+
+**"Docker daemon is not available" even though `docker ps` works on the CLI**
+Caused by the Docker SDK failing with `Not supported URL scheme http+docker`,
+an incompatibility between older `docker` SDK versions and modern `urllib3`.
+Fixed by pinning `docker>=7.1.0` in `requirements.txt`. Upgrade with
+`pip install --upgrade "docker>=7.1.0"` and restart the backend. Note that the
+Containers tab only shows containers dockchat created (labeled per user); it
+does not list pre-existing containers started outside the app.
 
 ## Notes on scope
 

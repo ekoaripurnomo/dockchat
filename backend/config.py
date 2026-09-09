@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     database_url: Optional[str] = None
     redis_url: Optional[str] = None
 
+    # Optional seeded admin: if all three are set, an admin account is created
+    # on startup when it does not already exist. Leave empty to disable.
+    seed_admin_username: Optional[str] = None
+    seed_admin_email: Optional[str] = None
+    seed_admin_password: Optional[str] = None
+
     # AI providers
     vllm_url: str = "http://localhost:8000/v1"
     vllm_model: str = "Qwen/Qwen2.5-14B-Instruct"
