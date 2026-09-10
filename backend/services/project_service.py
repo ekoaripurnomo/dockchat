@@ -7,6 +7,7 @@ the configured ALLOWED_PATHS to prevent arbitrary filesystem reads.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -50,7 +51,15 @@ _DETECTORS = [
     },
     {
         "type": "java", "marker": "pom.xml", "language": "java",
-        "package_manager": "maven", "base_image": "eclipse-temurin:21-jdk", "port": 8080,
+        "package_manager": "maven", "base_image": "maven:3.9-eclipse-temurin-21", "port": 8080,
+    },
+    {
+        "type": "java_gradle", "marker": "build.gradle", "language": "java",
+        "package_manager": "gradle", "base_image": "gradle:8-jdk21", "port": 8080,
+    },
+    {
+        "type": "java_gradle", "marker": "build.gradle.kts", "language": "java",
+        "package_manager": "gradle", "base_image": "gradle:8-jdk21", "port": 8080,
     },
     {
         "type": "php", "marker": "composer.json", "language": "php",
@@ -103,13 +112,40 @@ COPY --from=build /src/target/release/* /usr/local/bin/app
 EXPOSE {{ port }}
 CMD ["app"]
 """,
+    # Maven build: use the maven image (mvn preinstalled) so builds work even
+    # when the project does not commit the ./mvnw wrapper.
     "java": """\
-FROM {{ base_image }} AS build
+FROM maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /src
 COPY . .
-RUN ./mvnw -q package -DskipTests || mvn -q package -DskipTests
+RUN mvn -q clean package -DskipTests
 FROM eclipse-temurin:21-jre
+WORKDIR /app
 COPY --from=build /src/target/*.jar /app/app.jar
+EXPOSE {{ port }}
+CMD ["java", "-jar", "/app/app.jar"]
+""",
+    # Maven WAR project (traditional servlet app): build the war, deploy into Tomcat.
+    "java_war": """\
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /src
+COPY . .
+RUN mvn -q clean package -DskipTests
+FROM tomcat:10-jdk21
+RUN rm -rf /usr/local/tomcat/webapps/ROOT
+COPY --from=build /src/target/*.war /usr/local/tomcat/webapps/ROOT.war
+EXPOSE {{ port }}
+CMD ["catalina.sh", "run"]
+""",
+    # Gradle build variant.
+    "java_gradle": """\
+FROM gradle:8-jdk21 AS build
+WORKDIR /src
+COPY . .
+RUN gradle --no-daemon clean bootJar -x test || gradle --no-daemon clean build -x test
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /src/build/libs/*.jar /app/app.jar
 EXPOSE {{ port }}
 CMD ["java", "-jar", "/app/app.jar"]
 """,
@@ -186,18 +222,28 @@ class ProjectService:
 
         for rule in _DETECTORS:
             if rule["marker"] in present:
-                entrypoint = self._guess_entrypoint(root, rule["type"], present)
+                project_type = rule["type"]
+                base_image = rule["base_image"]
                 framework = self._guess_framework(root, rule["type"], present)
+
+                # Maven projects packaged as WAR need a servlet container (Tomcat),
+                # not `java -jar`. Detect this from the pom to pick the right template.
+                if rule["marker"] == "pom.xml" and self._maven_packaging(root) == "war":
+                    project_type = "java_war"
+                    base_image = "tomcat:10-jdk21"
+                    framework = framework or "servlet-war"
+
+                entrypoint = self._guess_entrypoint(root, project_type, present)
                 analysis = ProjectAnalysis(
                     path=str(root),
-                    project_type=rule["type"],
+                    project_type=project_type,
                     language=rule["language"],
                     framework=framework,
                     package_manager=rule["package_manager"],
                     entrypoint=entrypoint,
                     detected_files=sorted(present),
                     subdirectories=subdirs,
-                    suggested_base_image=rule["base_image"],
+                    suggested_base_image=base_image,
                     exposed_port=rule["port"],
                     readme_excerpt=readme,
                 )
@@ -229,6 +275,18 @@ class ProjectService:
         has_index = any(f.lower() == "index.html" for f in present)
         has_web_assets = bool({"js", "css", "style", "styles", "assets", "static"} & set(subdirs))
         return has_index or (bool(html_files) and has_web_assets)
+
+    def _maven_packaging(self, root: Path) -> Optional[str]:
+        """Read the top-level <packaging> from pom.xml (jar/war/pom)."""
+        pom = root / "pom.xml"
+        if not pom.exists():
+            return None
+        try:
+            text = pom.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+        match = re.search(r"<packaging>\s*([a-zA-Z]+)\s*</packaging>", text)
+        return match.group(1).lower() if match else "jar"
 
     def _read_readme(self, root: Path, present: set) -> Optional[str]:
         for name in present:

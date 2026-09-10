@@ -17,6 +17,7 @@ from backend.dependencies import app_state
 from backend.routes import audit, auth, chat, config as config_routes, docker
 from backend.services.ai_provider_manager import AIProviderManager
 from backend.services.audit_service import AuditService
+from backend.services.chat_history_service import ChatHistoryService
 from backend.services.chat_service import ChatService
 from backend.services.docker_service import DockerService
 from backend.services.project_service import ProjectService
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
     app_state.project_service = project_service
 
     app_state.chat_service = ChatService(provider_manager, docker_service, project_service)
+    app_state.chat_history_service = ChatHistoryService(db)
 
     yield
 

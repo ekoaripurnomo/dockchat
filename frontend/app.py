@@ -16,6 +16,9 @@ import streamlit as st
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8080")
 
+# Maximum number of chat messages to keep and send as context to the model.
+MAX_HISTORY = 50
+
 st.set_page_config(page_title="dockchat", page_icon="🐳", layout="wide")
 
 
@@ -27,14 +30,32 @@ def auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def api_post(path: str, json: Optional[dict] = None, auth: bool = True) -> requests.Response:
+def api_post(path: str, json: Optional[dict] = None, auth: bool = True,
+             timeout: int = 120) -> requests.Response:
     return requests.post(
-        f"{API_BASE_URL}{path}", json=json, headers=auth_headers() if auth else {}, timeout=120
+        f"{API_BASE_URL}{path}", json=json, headers=auth_headers() if auth else {}, timeout=timeout
     )
 
 
 def api_get(path: str, auth: bool = True) -> requests.Response:
     return requests.get(f"{API_BASE_URL}{path}", headers=auth_headers() if auth else {}, timeout=60)
+
+
+def api_delete(path: str, auth: bool = True) -> requests.Response:
+    return requests.delete(f"{API_BASE_URL}{path}", headers=auth_headers() if auth else {}, timeout=60)
+
+
+def load_chat_history() -> None:
+    """Load persisted chat history from the backend into the session."""
+    try:
+        resp = api_get("/api/chat/history")
+        if resp.status_code == 200:
+            msgs = resp.json()
+            st.session_state.messages = [
+                {"role": m["role"], "content": m["content"]} for m in msgs
+            ]
+    except requests.RequestException:
+        pass
 
 
 def parse_json(resp: requests.Response) -> Any:
@@ -124,6 +145,8 @@ def _store_session(data: Dict[str, Any]) -> None:
     st.session_state.refresh_token = data["refresh_token"]
     st.session_state.user = data["user"]
     st.session_state.username = data["user"]["username"]
+    # Restore the user's persisted conversation on login/registration.
+    load_chat_history()
 
 
 def logout() -> None:
@@ -202,25 +225,52 @@ def render_chat() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    # Render the conversation so far.
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    prompt = st.chat_input("e.g. Generate a Dockerfile for /workspace/my-app")
-    if prompt:
+    # NOTE: st.chat_input cannot be used inside an st.tabs container (raises a
+    # StreamlitAPIException in several versions), which would blank out this tab.
+    # A form with a text input + button works inside tabs and across versions.
+    with st.form("chat_form", clear_on_submit=True):
+        prompt = st.text_area(
+            "Message",
+            placeholder="e.g. Generate a Dockerfile for /home/eko/data/hextris",
+            height=80,
+            label_visibility="collapsed",
+        )
+        cols = st.columns([1, 1, 6])
+        submitted = cols[0].form_submit_button("Send", type="primary")
+        clear = cols[1].form_submit_button("Clear")
+
+    if clear:
+        try:
+            api_delete("/api/chat/history")
+        except requests.RequestException:
+            pass
+        st.session_state.messages = []
+        st.rerun()
+
+    if submitted and prompt and prompt.strip():
+        prompt = prompt.strip()
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        # Send only the most recent MAX_HISTORY messages as context to bound the
+        # model's context window and keep requests fast.
         history = [
             {"role": m["role"], "content": m["content"]}
             for m in st.session_state.messages[:-1]
             if m["role"] in ("user", "assistant")
-        ]
+        ][-MAX_HISTORY:]
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    resp = api_post("/api/chat", {"message": prompt, "history": history})
+                    # Chat can trigger a build via deploy_project, which is slow.
+                    resp = api_post("/api/chat", {"message": prompt, "history": history},
+                                    timeout=900)
                     if resp.status_code == 200:
                         data = resp.json()
                         reply = data.get("reply", "")
@@ -234,6 +284,10 @@ def render_chat() -> None:
                         st.error(f"Error: {detail}")
                 except requests.RequestException as exc:
                     st.error(f"Request failed: {exc}")
+
+        # The full conversation is kept in session and displayed. Only the last
+        # MAX_HISTORY messages are sent to the model as context (above); the UI
+        # shows everything the user has stored.
 
 
 def render_containers() -> None:
@@ -283,15 +337,40 @@ def render_containers() -> None:
                 show_response_error(resp, "Failed to list host containers")
 
 
+def _format_ports(ports: Dict[str, Any]) -> str:
+    """Turn Docker's raw port mapping into readable 'internal -> external' lines.
+
+    Docker shape: {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "34185"}], "9000/tcp": None}
+    - published:   80/tcp -> 34185
+    - unpublished: 9000/tcp (internal only)
+    """
+    if not ports:
+        return "—"
+    lines = []
+    for container_port, bindings in ports.items():
+        if container_port == "_remapped_from":
+            continue
+        if bindings:
+            host_ports = sorted({b.get("HostPort") for b in bindings if b.get("HostPort")})
+            for hp in host_ports:
+                lines.append(f"{container_port} → {hp}")
+        else:
+            lines.append(f"{container_port} (internal only)")
+    return "\n".join(lines) if lines else "—"
+
+
 def _render_container_row(c: Dict[str, Any], manageable: bool) -> None:
-    col1, col2, col3, col4 = st.columns([3, 2, 2, 3])
+    col1, col2, col3, col4, col5 = st.columns([3, 1.5, 2, 2, 2.5])
     col1.markdown(f"**{c['name']}**")
     col1.caption(c["image"])
     col2.write(c["status"])
     with col3:
+        st.markdown("**Ports** (internal → external)")
+        st.text(_format_ports(c.get("ports") or {}))
+    with col4:
         st.code(c["id"], language=None)
     if manageable:
-        with col4:
+        with col5:
             a1, a2, a3 = st.columns(3)
             if a1.button("▶", key=f"start_{c['id']}"):
                 api_post(f"/api/docker/containers/{c['id']}/start")
@@ -303,7 +382,7 @@ def _render_container_row(c: Dict[str, Any], manageable: bool) -> None:
                 api_post(f"/api/docker/containers/{c['id']}/remove")
                 st.rerun()
     else:
-        col4.caption("read-only")
+        col5.caption("read-only")
 
 
 def render_projects() -> None:
@@ -370,7 +449,7 @@ def render_projects() -> None:
                 "base_image": base_image or None,
                 "exposed_port": _opt_int(exposed_port),
                 "host_port": _opt_int(host_port),
-            })
+            }, timeout=900)
         if resp.status_code == 200:
             data = resp.json()
             c = data["container"]

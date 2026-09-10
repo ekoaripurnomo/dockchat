@@ -16,6 +16,7 @@ from backend.config import Settings, get_settings
 from backend.db.database import Database
 from backend.services.ai_provider_manager import AIProviderManager
 from backend.services.audit_service import AuditService
+from backend.services.chat_history_service import ChatHistoryService
 from backend.services.chat_service import ChatService
 from backend.services.docker_service import DockerService
 from backend.services.project_service import ProjectService
@@ -33,6 +34,7 @@ class AppState:
     docker_service: DockerService
     project_service: ProjectService
     chat_service: ChatService
+    chat_history_service: ChatHistoryService
 
 
 app_state = AppState()
@@ -66,6 +68,10 @@ def get_project_service() -> ProjectService:
 
 def get_chat_service() -> ChatService:
     return app_state.chat_service
+
+
+def get_chat_history_service() -> ChatHistoryService:
+    return app_state.chat_history_service
 
 
 async def get_current_user(

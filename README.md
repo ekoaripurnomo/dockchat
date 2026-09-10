@@ -110,10 +110,27 @@ The built image is tagged `<dirname>:latest` by default and labeled per user;
 the container appears in the **📦 Containers** tab where you can start/stop/remove
 it.
 
-Supported project types: Node, Python, Go, Rust, Java, PHP, Ruby, and **static
-sites** (HTML/JS/CSS with an `index.html`, served via nginx). Anything else falls
-back to a generic template. Analysis also reads a `README` excerpt and lists
-subdirectories to give richer context.
+Supported project types: Node, Python, Go, Rust, Java (Maven **and** Gradle),
+PHP, Ruby, and **static sites** (HTML/JS/CSS with an `index.html`, served via
+nginx). Anything else falls back to a generic template. Analysis also reads a
+`README` excerpt and lists subdirectories to give richer context.
+
+Java builds use a multi-stage Dockerfile with a build image that already has the
+build tool installed (`maven:3.9-eclipse-temurin-21` for Maven,
+`gradle:8-jdk21` for Gradle), then run the produced artifact. This avoids relying
+on a committed `./mvnw`/`./gradlew` wrapper.
+
+- **Jar projects** (Spring Boot / executable jars) run on `eclipse-temurin:21-jre`
+  via `java -jar`.
+- **War projects** (`<packaging>war</packaging>`) are detected from the pom and
+  deployed into `tomcat:10-jdk21` as `ROOT.war`, since a war needs a servlet
+  container rather than `java -jar`.
+
+> Builds can take several minutes (downloading dependencies, compiling). The
+> chat and deploy requests use a long client timeout to accommodate this. If a
+> build fails, the error usually comes from the **project's own source** (e.g. a
+> compilation error), not from dockchat — check the build logs in the deploy
+> response.
 
 > Note: **Build & Run / deploy writes a `Dockerfile` and `.dockerignore` into the
 > project directory** (they are needed as the build context). Generate + preview
@@ -137,10 +154,23 @@ rather than telling you to run docker commands manually. `create_container`
 requires an image that already exists locally; if it doesn't, the model builds
 it first.
 
+**Chat history:** messages are persisted per user in the `chat_messages` table,
+so your conversation is restored when you log back in or reload the page. The UI
+displays the **full** stored history, while only the most recent 50 messages are
+sent to the model as context (to bound token usage). Use the **Clear** button
+(or `DELETE /api/chat/history`) to wipe your history. In in-memory mode (no
+`DATABASE_URL`) history still works but is lost on backend restart.
+
+Endpoints:
+- `GET /api/chat/history` — full history (chronological). Pass `?limit=N` to cap
+  to the N most recent messages.
+- `DELETE /api/chat/history` — clear the user's history.
+
 **Host port handling:** when a requested host port is already in use, dockchat
 automatically picks a free port instead of failing, and reports the mapping
-(`ports._remapped_from`). Check the actual published port in the 📦 Containers
-tab.
+(`ports._remapped_from`). The 📦 Containers tab shows a **Ports (internal →
+external)** column, e.g. `80/tcp → 34185` for a published port, or
+`5000/tcp (internal only)` for a port that is exposed but not published.
 
 > Building and running requires a working Docker daemon on the backend host
 > (`GET /api/docker/status` must report `available: true`).
@@ -257,7 +287,9 @@ setting, since they call their own endpoints rather than going through the LLM.
 | `POST /api/docker/projects/analyze` | Detect project type |
 | `POST /api/docker/projects/generate-dockerfile` | Generate Dockerfile |
 | `POST /api/docker/projects/deploy` | Analyze → Dockerfile → build → run, in one call |
-| `POST /api/chat` | Chat with tool-calling |
+| `POST /api/chat` | Chat with tool-calling (persists messages) |
+| `GET /api/chat/history` | Full chat history (`?limit=N` to cap) |
+| `DELETE /api/chat/history` | Clear the user's chat history |
 | `GET /api/audit/logs` | User activity log |
 
 ## Troubleshooting

@@ -19,6 +19,7 @@ class MemoryStore:
         self.containers: Dict[str, dict] = {}      # id -> row
         self.projects: Dict[str, dict] = {}        # id -> row
         self.audit_logs: List[dict] = []
+        self.chat_messages: List[dict] = []        # per-user chat history rows
 
     @property
     def lock(self) -> threading.RLock:
